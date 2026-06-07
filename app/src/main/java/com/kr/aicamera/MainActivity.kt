@@ -4,12 +4,22 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.hardware.camera2.CameraManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.media.CamcorderProfile
 import android.media.MediaActionSound
+import android.media.MediaRecorder
+import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
 import android.util.Size
 import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -20,6 +30,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.kr.aicamera.databinding.ActivityMainBinding
+import java.io.File
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
@@ -40,12 +51,32 @@ class MainActivity : AppCompatActivity() {
 
     // Mode: 0 = Foto, 1 = Video, 2 = Portrait
     private var currentMode = 0
+    private val modeNames = arrayOf("FOTO", "VIDEO", "PORTRAIT")
 
     // Suara shutter
     private val shutterSound = MediaActionSound()
 
     // Gesture detector untuk swipe
     private lateinit var gestureDetector: GestureDetector
+
+    // Grid
+    private var isGridEnabled = false
+
+    // Timer
+    private var timerSeconds = 0
+    private var timerCountDown: CountDownTimer? = null
+
+    // Rekaman video
+    private var mediaRecorder: MediaRecorder? = null
+    private var videoFile: File? = null
+    private var isRecording = false
+
+    // Geotagging
+    private var lastLocation: Location? = null
+    private lateinit var locationManager: LocationManager
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(loc: Location) { lastLocation = loc }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,26 +85,15 @@ class MainActivity : AppCompatActivity() {
 
         prefs = getSharedPreferences("KR_CAMERA_PREFS", MODE_PRIVATE)
         loadSettings()
+        locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
 
-        // Setup gesture untuk swipe mode
+        // Gesture swipe mode
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onFling(
-                e1: MotionEvent?,
-                e2: MotionEvent,
-                velocityX: Float,
-                velocityY: Float
-            ): Boolean {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
                 if (e1 == null) return false
                 val diffX = e2.x - e1.x
-                val diffY = e2.y - e1.y
-                if (Math.abs(diffX) > Math.abs(diffY) && Math.abs(diffX) > 100 && Math.abs(velocityX) > 100) {
-                    if (diffX > 0) {
-                        // Swipe kanan -> mode sebelumnya
-                        currentMode = if (currentMode == 0) 2 else currentMode - 1
-                    } else {
-                        // Swipe kiri -> mode berikutnya
-                        currentMode = if (currentMode == 2) 0 else currentMode + 1
-                    }
+                if (Math.abs(diffX) > Math.abs(e2.y - e1.y) && Math.abs(diffX) > 100 && Math.abs(velocityX) > 100) {
+                    currentMode = if (diffX > 0) (currentMode - 1 + modeNames.size) % modeNames.size else (currentMode + 1) % modeNames.size
                     runOnUiThread { updateModeUI() }
                     return true
                 }
@@ -81,17 +101,12 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // Pasang touch listener untuk gesture
-        binding.viewFinder.setOnTouchListener { _, event ->
-            gestureDetector.onTouchEvent(event)
-            true
-        }
+        binding.viewFinder.setOnTouchListener { _, event -> gestureDetector.onTouchEvent(event); true }
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.ACCESS_FINE_LOCATION), 100)
         } else {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 100)
+            startCamera()
         }
     }
 
@@ -104,7 +119,6 @@ class MainActivity : AppCompatActivity() {
             "720p_30" -> { backRes = Size(1280, 720); backFps = 30 }
             else -> { backRes = Size(1920, 1080); backFps = 30 }
         }
-
         val frontResStr = prefs.getString("FRONT_RES", "720p_30") ?: "720p_30"
         when (frontResStr) {
             "1080p_60" -> { frontRes = Size(1920, 1080); frontFps = 60 }
@@ -112,24 +126,26 @@ class MainActivity : AppCompatActivity() {
             "720p_60" -> { frontRes = Size(1280, 720); frontFps = 60 }
             else -> { frontRes = Size(1280, 720); frontFps = 30 }
         }
-
         flashMode = when (prefs.getString("FLASH", "off")) {
             "on" -> ImageCapture.FLASH_MODE_ON
             "auto" -> ImageCapture.FLASH_MODE_AUTO
             else -> ImageCapture.FLASH_MODE_OFF
         }
-        updateFlashIcon()
+        isGridEnabled = prefs.getBoolean("GRID", false)
+        if (isGridEnabled) binding.gridOverlay.visibility = View.VISIBLE else binding.gridOverlay.visibility = View.GONE
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 100 && grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == 100 && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
             startCamera()
+            startLocationUpdates()
+        }
+    }
+
+    private fun startLocationUpdates() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 1f, locationListener)
         }
     }
 
@@ -140,18 +156,15 @@ class MainActivity : AppCompatActivity() {
             bindCamera(cameraProvider, lensFacing)
             setupButtons(cameraProvider)
             updateModeUI()
+            startLocationUpdates()
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun bindCamera(cameraProvider: ProcessCameraProvider, facing: Int) {
         cameraProvider.unbindAll()
-
         val resSize = if (facing == CameraSelector.LENS_FACING_BACK) backRes else frontRes
-
         val resolutionSelector = ResolutionSelector.Builder()
-            .setResolutionStrategy(
-                ResolutionStrategy(resSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
-            )
+            .setResolutionStrategy(ResolutionStrategy(resSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
             .build()
 
         val preview = Preview.Builder()
@@ -165,80 +178,47 @@ class MainActivity : AppCompatActivity() {
             .setFlashMode(flashMode)
             .build()
 
-        val cameraSelector = CameraSelector.Builder()
-            .requireLensFacing(facing)
-            .build()
-
+        val cameraSelector = CameraSelector.Builder().requireLensFacing(facing).build()
         try {
             camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture)
         } catch (e: Exception) {
-            Toast.makeText(this, "Resolusi tidak didukung, gunakan fallback", Toast.LENGTH_SHORT).show()
-            val fallbackPreview = Preview.Builder().build()
-                .also { it.setSurfaceProvider(binding.viewFinder.surfaceProvider) }
-            val fallbackCapture = ImageCapture.Builder()
-                .setFlashMode(flashMode)
-                .build()
+            Toast.makeText(this, "Resolusi tidak didukung", Toast.LENGTH_SHORT).show()
+            val fallbackPreview = Preview.Builder().build().also { it.setSurfaceProvider(binding.viewFinder.surfaceProvider) }
+            val fallbackCapture = ImageCapture.Builder().build()
             camera = cameraProvider.bindToLifecycle(this, cameraSelector, fallbackPreview, fallbackCapture)
         }
     }
 
     private fun updateModeUI() {
-        binding.tvModeVideo.setTextColor(android.graphics.Color.parseColor("#66FFFFFF"))
-        binding.tvModePhoto.setTextColor(android.graphics.Color.parseColor("#66FFFFFF"))
-        binding.tvModePortrait.setTextColor(android.graphics.Color.parseColor("#66FFFFFF"))
-        binding.dotModePhoto.visibility = android.view.View.INVISIBLE
-
-        when (currentMode) {
-            0 -> {
-                binding.tvModePhoto.setTextColor(android.graphics.Color.parseColor("#22D3EE"))
-                binding.dotModePhoto.visibility = android.view.View.VISIBLE
-                binding.btnCapture.setImageResource(R.drawable.ic_camera)
-            }
-            1 -> {
-                binding.tvModeVideo.setTextColor(android.graphics.Color.parseColor("#22D3EE"))
-                binding.btnCapture.setImageResource(R.drawable.ic_video)
-            }
-            2 -> {
-                binding.tvModePortrait.setTextColor(android.graphics.Color.parseColor("#22D3EE"))
-                binding.btnCapture.setImageResource(R.drawable.ic_portrait)
-            }
-        }
+        binding.txtMode.text = modeNames[currentMode]
+        binding.btnCapture.setImageResource(when (currentMode) {
+            0 -> R.drawable.ic_camera
+            1 -> if (isRecording) R.drawable.ic_stop else R.drawable.ic_video
+            2 -> R.drawable.ic_portrait
+            else -> R.drawable.ic_camera
+        })
     }
 
     private fun setupButtons(cameraProvider: ProcessCameraProvider) {
         binding.btnCapture.setOnClickListener {
             when (currentMode) {
                 0 -> takePhoto()
-                1 -> Toast.makeText(this, "Mode video coming soon", Toast.LENGTH_SHORT).show()
-                2 -> takePhoto() // Let Portrait mode also take photos for now
+                1 -> toggleRecording()
+                2 -> takePhoto() // portrait placeholder
             }
         }
-
         binding.btnSwitchCamera.setOnClickListener {
-            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-                CameraSelector.LENS_FACING_FRONT
-            else
-                CameraSelector.LENS_FACING_BACK
+            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             bindCamera(cameraProvider, lensFacing)
         }
-
         binding.btnGallery.setOnClickListener {
             startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                type = "image/*"
+                type = if (currentMode == 1) "video/*" else "image/*"
             })
         }
-
         binding.btnSettings.setOnClickListener { showSettingsDialog() }
-
         binding.btnFlash.setOnClickListener { toggleFlash() }
-    }
-
-    private fun updateFlashIcon() {
-        binding.btnFlash.setImageResource(when (flashMode) {
-            ImageCapture.FLASH_MODE_ON -> R.drawable.ic_flash_on
-            ImageCapture.FLASH_MODE_AUTO -> R.drawable.ic_flash_auto
-            else -> R.drawable.ic_flash_off
-        })
+        binding.thumbnail.setOnClickListener { binding.btnGallery.performClick() }
     }
 
     private fun toggleFlash() {
@@ -252,107 +232,197 @@ class MainActivity : AppCompatActivity() {
             ImageCapture.FLASH_MODE_AUTO -> "auto"
             else -> "off"
         }).apply()
-
-        updateFlashIcon()
-        
-        // Restart kamera untuk menerapkan flash mode
+        binding.btnFlash.setImageResource(when (flashMode) {
+            ImageCapture.FLASH_MODE_ON -> R.drawable.ic_flash_on
+            ImageCapture.FLASH_MODE_AUTO -> R.drawable.ic_flash_auto
+            else -> R.drawable.ic_flash_off
+        })
         startCamera()
     }
 
     private fun showSettingsDialog() {
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("Pengaturan Kamera")
-        val items = arrayOf("Kamera Belakang", "Kamera Depan")
-        builder.setItems(items) { _, which ->
-            if (which == 0) showBackSettings() else showFrontSettings()
+        AlertDialog.Builder(this).apply {
+            setTitle("Pengaturan Kamera")
+            setItems(arrayOf("Kamera Belakang", "Kamera Depan", "Grid", "Timer")) { _, which ->
+                when (which) {
+                    0 -> showBackSettings()
+                    1 -> showFrontSettings()
+                    2 -> {
+                        isGridEnabled = !isGridEnabled
+                        prefs.edit().putBoolean("GRID", isGridEnabled).apply()
+                        binding.gridOverlay.visibility = if (isGridEnabled) View.VISIBLE else View.GONE
+                    }
+                    3 -> showTimerDialog()
+                }
+            }
+            show()
         }
-        builder.show()
     }
 
     private fun showBackSettings() {
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("Resolusi Belakang")
-        val options = arrayOf("4K 30fps", "4K 60fps", "1080p 30fps", "1080p 60fps", "720p 30fps")
-        builder.setItems(options) { _, which ->
-            prefs.edit().putString("BACK_RES", options[which].replace(" ", "_")).apply()
-            loadSettings()
-            startCamera()
+        AlertDialog.Builder(this).apply {
+            setTitle("Resolusi Belakang")
+            setItems(arrayOf("4K 30fps", "4K 60fps", "1080p 30fps", "1080p 60fps", "720p 30fps")) { _, i ->
+                prefs.edit().putString("BACK_RES", arrayOf("4K_30","4K_60","1080p_30","1080p_60","720p_30")[i]).apply()
+                loadSettings()
+                startCamera()
+            }
+            show()
         }
-        builder.show()
     }
 
     private fun showFrontSettings() {
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("Resolusi Depan")
-        val options = arrayOf("1080p 30fps", "1080p 60fps", "720p 30fps", "720p 60fps")
-        builder.setItems(options) { _, which ->
-            prefs.edit().putString("FRONT_RES", options[which].replace(" ", "_")).apply()
-            loadSettings()
-            startCamera()
+        AlertDialog.Builder(this).apply {
+            setTitle("Resolusi Depan")
+            setItems(arrayOf("1080p 30fps", "1080p 60fps", "720p 30fps", "720p 60fps")) { _, i ->
+                prefs.edit().putString("FRONT_RES", arrayOf("1080p_30","1080p_60","720p_30","720p_60")[i]).apply()
+                loadSettings()
+                startCamera()
+            }
+            show()
         }
-        builder.show()
+    }
+
+    private fun showTimerDialog() {
+        AlertDialog.Builder(this).apply {
+            setTitle("Timer")
+            setItems(arrayOf("Off", "3 detik", "5 detik", "10 detik")) { _, i ->
+                timerSeconds = when (i) { 1->3; 2->5; 3->10; else->0 }
+            }
+            show()
+        }
     }
 
     private fun takePhoto() {
+        if (timerSeconds > 0) {
+            startTimer { capturePhoto() }
+        } else {
+            capturePhoto()
+        }
+    }
+
+    private fun capturePhoto() {
         val capture = imageCapture ?: return
-
-        // Putar suara shutter
         shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-
         val fileName = "KR_AI_${System.currentTimeMillis()}.jpg"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
-                put(MediaStore.Images.Media.IS_PENDING, 1) // Penting untuk Android 10+
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            // Tambah lokasi jika ada
+            lastLocation?.let {
+                put(MediaStore.Images.Media.LATITUDE, it.latitude)
+                put(MediaStore.Images.Media.LONGITUDE, it.longitude)
             }
         }
-
-        val uri = contentResolver.insert(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            values
-        ) ?: run {
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: run {
             Toast.makeText(this, "Gagal membuat file", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(
-            contentResolver,
-            uri,
-            values
-        ).build()
-
         capture.takePicture(
-            outputOptions,
+            ImageCapture.OutputFileOptions.Builder(contentResolver, uri, values).build(),
             cameraExecutor,
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    // Tandai file sudah selesai ditulis
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         values.clear()
                         values.put(MediaStore.Images.Media.IS_PENDING, 0)
                         contentResolver.update(uri, values, null, null)
                     }
+                    // Tampilkan thumbnail
                     runOnUiThread {
-                        Toast.makeText(this@MainActivity, "Foto tersimpan ✅", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "Foto tersimpan", Toast.LENGTH_SHORT).show()
+                        val bitmap = BitmapFactory.decodeStream(contentResolver.openInputStream(uri))
+                        binding.thumbnail.setImageBitmap(bitmap)
+                        binding.thumbnail.visibility = View.VISIBLE
                     }
                 }
-
                 override fun onError(exception: ImageCaptureException) {
-                    // Hapus file pending jika gagal
                     contentResolver.delete(uri, null, null)
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, "Gagal: ${exception.message}", Toast.LENGTH_SHORT).show()
-                    }
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Gagal: ${exception.message}", Toast.LENGTH_SHORT).show() }
                 }
             }
         )
     }
 
+    private fun startTimer(onFinish: () -> Unit) {
+        binding.txtTimer.visibility = View.VISIBLE
+        timerCountDown = object : CountDownTimer(timerSeconds * 1000L, 1000) {
+            override fun onTick(millisUntilFinished: Long) {
+                binding.txtTimer.text = "${millisUntilFinished / 1000}"
+            }
+            override fun onFinish() {
+                binding.txtTimer.visibility = View.GONE
+                onFinish()
+            }
+        }.start()
+    }
+
+    private fun toggleRecording() {
+        if (isRecording) stopRecording() else startRecording()
+    }
+
+    private fun startRecording() {
+        val camera = camera ?: return
+        val file = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "KR_Video_${System.currentTimeMillis()}.mp4")
+        videoFile = file
+        val profile = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+            CamcorderProfile.get(CamcorderProfile.QUALITY_1080P) else CamcorderProfile.get(CamcorderProfile.QUALITY_720P)
+        mediaRecorder = MediaRecorder(this).apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
+            setVideoFrameRate(profile.videoFrameRate)
+            setOutputFile(file.absolutePath)
+            prepare()
+            start()
+        }
+        isRecording = true
+        updateModeUI()
+        Toast.makeText(this, "Merekam video...", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun stopRecording() {
+        mediaRecorder?.apply {
+            stop()
+            release()
+        }
+        mediaRecorder = null
+        isRecording = false
+        updateModeUI()
+
+        // Simpan ke galeri
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, videoFile?.name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+        }
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return
+        contentResolver.openOutputStream(uri)?.use { out ->
+            videoFile?.inputStream()?.copyTo(out)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.clear()
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+        }
+        videoFile?.delete()
+        Toast.makeText(this, "Video tersimpan", Toast.LENGTH_SHORT).show()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        shutterSound.release() // Properly release sound pool
+        locationManager.removeUpdates(locationListener)
     }
 }
