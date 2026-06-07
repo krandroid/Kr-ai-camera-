@@ -18,7 +18,6 @@ class GridOverlayView(context: Context, attrs: AttributeSet) : View(context, att
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
-        // Rule of thirds
         for (i in 1..2) {
             val x = w * i / 3
             canvas.drawLine(x, 0f, x, h, paint)

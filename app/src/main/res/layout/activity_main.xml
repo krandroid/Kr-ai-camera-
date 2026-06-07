@@ -11,7 +11,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Grid overlay (bisa di-toggle) -->
+    <!-- Grid overlay transparan -->
     <com.kr.aicamera.GridOverlayView
         android:id="@+id/gridOverlay"
         android:layout_width="0dp"
@@ -39,7 +39,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Tombol Flash -->
+    <!-- Tombol Flash (kiri atas) -->
     <ImageButton
         android:id="@+id/btnFlash"
         android:layout_width="48dp"
@@ -51,7 +51,7 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
-    <!-- Tombol Switch Kamera -->
+    <!-- Tombol Switch Kamera (kanan atas) -->
     <ImageButton
         android:id="@+id/btnSwitchCamera"
         android:layout_width="48dp"
@@ -63,7 +63,7 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Thumbnail pratinjau (pojok kiri bawah) -->
+    <!-- Thumbnail pratinjau (kiri bawah) -->
     <ImageView
         android:id="@+id/thumbnail"
         android:layout_width="56dp"
